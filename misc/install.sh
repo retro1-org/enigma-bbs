@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
+set -euo pipefail
 
 { # this ensures the entire script is downloaded before execution
 ENIGMA_BRANCH=${ENIGMA_BRANCH:=master}
 ENIGMA_INSTALL_DIR=${ENIGMA_INSTALL_DIR:=$HOME/enigma-bbs}
 ENIGMA_SOURCE=${ENIGMA_SOURCE:=https://github.com/NuSkooler/enigma-bbs.git}
-TIME_FORMAT=`date "+%Y-%m-%d %H:%M:%S"`
+TIME_FORMAT=$(date "+%Y-%m-%d %H:%M:%S")
 
 # ANSI Codes
 RESET="\e[0m"
@@ -39,7 +40,7 @@ BACKGROUND_STRONG_BLACK="\e[100m"
 BACKGROUND_STRONG_RED="\e[101m"
 BACKGROUND_STRONG_GREEN="\e[102m"
 BACKGROUND_STRONG_YELLOW="\e[103m"
-BACKGROUND_STRONG_BLUE="\w[104m"
+BACKGROUND_STRONG_BLUE="\e[104m"   # <- fix
 BACKGROUND_STRONG_MAGENTA="\e[105m"
 BACKGROUND_STRONG_CYAN="\e[106m"
 BACKGROUND_STRONG_WHITE="\e[107m"
@@ -72,12 +73,12 @@ fatal_error() {
 }
 
 check_exists() {
-    command -v $1 >/dev/null 2>&1 ;
+    command -v "$1" >/dev/null 2>&1 ;
 }
 
 enigma_install_needs_ex() {
     log "Checking for '$1'...${RESET}"
-    if check_exists $1 ; then
+    if check_exists "$1" ; then
         log " Found!"
     else
         fatal_error "ENiGMA½ requires '$1' but it was not found. Please install it and/or make sure it is in your path then restart the installer.\n\n$2"
@@ -85,7 +86,7 @@ enigma_install_needs_ex() {
 }
 
 enigma_install_needs() {
-    enigma_install_needs_ex $1 "Examples:\n  sudo apt install $1 # Debian/Ubuntu\n  sudo yum install $1 # CentOS"
+    enigma_install_needs_ex "$1" "Examples:\n  sudo apt install $1 # Debian/Ubuntu\n  sudo yum install $1 # CentOS"
 }
 
 enigma_has_mise() {
@@ -122,24 +123,6 @@ enigma_install_init() {
     enigma_install_needs gcc
 }
 
-install_mise_en_place() {
-    curl https://mise.run | sh
-
-    # ~/.local/bin/mise activate bash >> bash
-    eval "$(~/.local/bin/mise activate bash)"
-
-    cd $ENIGMA_INSTALL_DIR
-
-    mise install
-
-    export PATH="$HOME/.local/share/mise/shims:$PATH"
-}
-
-install_tools() {
-    # Used to read toml files from bash scripts
-    python -m pip install toml-cli
-}
-
 download_enigma_source() {
     local INSTALL_DIR
     INSTALL_DIR=${ENIGMA_INSTALL_DIR}
@@ -151,13 +134,14 @@ download_enigma_source() {
     else
         log "Downloading ENiGMA½ from git to '$INSTALL_DIR'"
         mkdir -p "$INSTALL_DIR"
-        command git clone ${ENIGMA_SOURCE} "$INSTALL_DIR" ||
+        command git clone "${ENIGMA_SOURCE}" "$INSTALL_DIR" ||
             fatal_error "Failed to clone ENiGMA½ repo. Please report this!"
     fi
 }
 
 is_arch_arm() {
-    local ARCH=`arch`
+    local ARCH
+    ARCH=$(arch)
     if [[ $ARCH == "arm"* ]]; then
         true
     else
@@ -173,21 +157,103 @@ extra_npm_install_args() {
     fi
 }
 
+# --- NEW: mise-Installer + Runtime-Setup (Node 18 + Python 3.11) ---
+install_mise_en_place() {
+    # Basis-Tooling / Build-Dependencies
+    log "Installing base build tools and libraries..."
+    sudo apt-get update
+    sudo apt-get install -y build-essential curl git pkg-config \
+        libssl-dev zlib1g-dev libbz2-dev libreadline-dev libsqlite3-dev \
+        libffi-dev libncursesw5-dev xz-utils tk-dev python3-pip
+
+    # mise installieren, falls noch nicht vorhanden
+    if ! command -v mise >/dev/null 2>&1; then
+        log "Installing mise..."
+        curl -fsSL https://mise.jdx.dev/install.sh | sh
+        # Shell-Hook aktivieren (Bash)
+        if ! grep -q 'mise activate bash' "${HOME}/.bashrc"; then
+            echo 'eval "$(~/.local/bin/mise activate bash)"' >> "${HOME}/.bashrc"
+        fi
+    fi
+
+    # Aktuelle Shell für mise aktivieren
+    eval "$(~/.local/bin/mise activate bash)"
+
+    # Shims in PATH sicherstellen (sofort im aktuellen Run)
+    export PATH="$HOME/.local/share/mise/shims:$PATH"
+}
+
+setup_runtime_node18_py311() {
+    log "Setting up Node 18 and Python 3.11 via mise..."
+    mise install node@18.20
+    mise use -g node@18.20
+
+    mise install python@3.11
+    mise use -g python@3.11
+
+    # node-gyp explizit auf dieses Python zeigen (npm v10+: keine npm config mehr dafür)
+    local PYBIN
+    PYBIN="$(mise which python)"
+
+    export npm_config_python="$PYBIN"
+    export NODE_GYP_FORCE_PYTHON="$PYBIN"
+
+    # INFO: 'npm config set python' entfällt unter npm v10+ (sonst: "not a valid npm option")
+
+    log "Runtime ready. Node: $(node -v), Python: $("$PYBIN" -V)"
+}
+
+# --- /NEW ---
+
+install_tools() {
+    local PYBIN
+    PYBIN="$(mise which python || command -v python3)"
+    "$PYBIN" -m pip install --user toml-cli || true
+}
+
 install_node_packages() {
     log "Installing required Node packages..."
     printf "Note that on some systems such as RPi, this can take a VERY long time. Be patient!"
 
-    cd ${ENIGMA_INSTALL_DIR}
-    local EXTRA_NPM_ARGS=$(extra_npm_install_args)
-    git checkout ${ENIGMA_BRANCH}
+    cd "${ENIGMA_INSTALL_DIR}"
+    local EXTRA_NPM_ARGS
+    EXTRA_NPM_ARGS=$(extra_npm_install_args)
+    git checkout "${ENIGMA_BRANCH}"
 
-    npm install ${EXTRA_NPM_ARGS}
+    # 1) Prepare-Hook (husky) im Root-Paket deaktivieren, damit 'husky: not found' nicht triggert
+    if [ -f package.json ]; then
+        log "Disabling root 'prepare' (husky) script in package.json..."
+        cp package.json package.json.bak 2>/dev/null || true
+        python3 - <<'PY'
+import json, sys
+p = json.load(open("package.json","r",encoding="utf-8"))
+if isinstance(p.get("scripts"), dict) and "prepare" in p["scripts"]:
+    # nur auskommentieren/entfernen, nicht den Rest anfassen
+    del p["scripts"]["prepare"]
+    json.dump(p, open("package.json","w",encoding="utf-8"), ensure_ascii=False, indent=2)
+PY
+    fi
+
+    # 2) Husky dennoch sicherheitshalber deaktivieren (falls irgendwo transitiv)
+    export HUSKY=0
+
+    # 3) sauberer Re-Install
+    rm -rf node_modules
+
+    # Wichtig: NICHT --omit=dev verwenden, damit native Module (z.B. sharp) ihre Install-Skripte ausführen dürfen
+    if [ -f package-lock.json ]; then
+        npm ci ${EXTRA_NPM_ARGS}
+    else
+        npm install ${EXTRA_NPM_ARGS}
+    fi
+
     if [ $? -eq 0 ]; then
         log "npm package installation complete"
     else
         fatal_error "Failed to install ENiGMA½ npm packages. Please report this!"
     fi
 }
+
 
 copy_template_files() {
     log "Copying Template Files to ${ENIGMA_INSTALL_DIR}/misc/gophermap"
@@ -262,7 +328,7 @@ post_install() {
     then
         log "Mise Shims found in your ~/.bashrc"
     else
-        echo $MISE_SHIM_PATH_COMMAND >> ~/.bashrc
+        echo "$MISE_SHIM_PATH_COMMAND" >> ~/.bashrc
         log "Installed Mise Shims into your ~/.bashrc"
     fi
 }
@@ -271,7 +337,11 @@ install_dependencies() {
     log "Installing Dependencies..."
 
     enigma_install_init
-    install_mise_en_place
+    download_enigma_source   # Repo muss da sein, falls mise später 'mise install' bräuchte
+
+    install_mise_en_place    # mise + Build-Deps
+    setup_runtime_node18_py311
+
     install_tools
     install_node_packages
     post_install
